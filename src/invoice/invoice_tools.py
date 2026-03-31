@@ -225,7 +225,7 @@ def generate_invoice_pdf_url(
             local_path,
             exc,
         )
-        return ""
+        return str(local_path)
 
 
     

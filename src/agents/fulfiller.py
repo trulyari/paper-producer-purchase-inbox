@@ -63,11 +63,18 @@ def send_confirmation_email_with_approval(
     
     # Step 2: Block and wait for human approval (polls Slack thread every 2s)
     channel = os.getenv("SLACK_APPROVAL_CHANNEL", "orders")  # Channel name WITHOUT #
-    approved = get_approval_from_slack(
-        channel=channel,
-        thread_ts=thread_ts,
-        timeout=60,  # 1 minute for human to respond
-    )
+    try:
+        approved = get_approval_from_slack(
+            channel=channel,
+            thread_ts=thread_ts,
+            timeout=60,  # 1 minute for human to respond
+        )
+    except Exception as e:
+        return {
+            "status": "error",
+            "reason": f"Slack polling failed: {str(e)}",
+            "email_sent": "false",
+        }
     
     # Step 3: If approved, send confirmation email immediately
     if approved:
@@ -143,7 +150,7 @@ STEP 1 - Customer setup (if needed):
 STEP 2 - Generate invoice:
    • Call generate_invoice_pdf_url(order_context=input_payload)
    • Store the returned URL string as invoice_url
-   • If the function returns an empty string, continue anyway: it means the PDF was generated locally but cloud upload was unavailable
+   • If the function returns a local file path (starts with '/') instead of an 'https://' URL, continue anyway: it means the PDF was generated locally because cloud upload was unavailable — the email tool will attach it automatically
    • Continue to STEP 3
 
 STEP 3 - Request human approval and send email:

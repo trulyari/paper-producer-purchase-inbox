@@ -133,9 +133,16 @@ def _load_reply_context(message_id: str) -> tuple[Any, dict[str, str], str]:
     return service, headers, original["threadId"]
 
 
-def _send_reply(service: Any, headers: dict[str, str], thread_id: str, 
-                reply_body: str, html_body: str | None = None) -> dict[str, str]:
-    """Create and send Gmail reply."""
+def _send_reply(
+    service: Any,
+    headers: dict[str, str],
+    thread_id: str,
+    reply_body: str,
+    html_body: str | None = None,
+    pdf_attachment: bytes | None = None,
+    pdf_filename: str = "invoice.pdf",
+) -> dict[str, str]:
+    """Create and send Gmail reply, optionally with a PDF attachment."""
     msg = EmailMessage()
     msg["To"] = headers.get("From", "")
     msg["Subject"] = "Re: " + headers.get("Subject", "")
@@ -144,6 +151,13 @@ def _send_reply(service: Any, headers: dict[str, str], thread_id: str,
     msg.set_content(reply_body)
     if html_body:
         msg.add_alternative(html_body, subtype="html")
+    if pdf_attachment:
+        msg.add_attachment(
+            pdf_attachment,
+            maintype="application",
+            subtype="pdf",
+            filename=pdf_filename,
+        )
 
     encoded_message = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     result = service.users().messages().send(
@@ -237,20 +251,42 @@ def _format_reply(customer: str, lines: list[str]) -> str:
 
 @tool()
 def respond_confirmation_email(message_id: str, pdf_url: str | None = None) -> dict[str, str]:
-    """Send order confirmation email."""
+    """Send order confirmation email, attaching the invoice PDF if available."""
     service, headers, thread_id = _load_reply_context(message_id)
 
     customer = headers.get("From", "Valued Customer")
+
+    # Determine whether pdf_url is a remote URL or a local file path
+    pdf_attachment: bytes | None = None
+    pdf_filename = "invoice.pdf"
+    invoice_line: str
+
+    if pdf_url and pdf_url.startswith("http"):
+        invoice_line = f"Download invoice: {pdf_url}"
+    elif pdf_url:
+        # Local file path returned when Azure upload was unavailable — attach instead
+        local_pdf = Path(pdf_url)
+        if local_pdf.exists():
+            pdf_attachment = local_pdf.read_bytes()
+            pdf_filename = local_pdf.name
+            invoice_line = "Your invoice is attached to this email."
+            logger.info(f"Attaching local invoice PDF for {message_id}: {local_pdf}")
+        else:
+            invoice_line = "Invoice link coming soon."
+            logger.warning(f"Local invoice file not found: {local_pdf}")
+    else:
+        invoice_line = "Invoice link coming soon."
+
     reply_body = _format_reply(customer, [
         "Your purchase order has been confirmed.",
         "We're processing your items and will notify you once they ship.",
-        f"Download invoice: {pdf_url}" if pdf_url else "Invoice link coming soon.",
+        invoice_line,
         "",
         "Thank you for choosing PaperCo!",
     ])
 
     logger.info(f"Sending fulfillment email for {message_id}")
-    return _send_reply(service, headers, thread_id, reply_body)
+    return _send_reply(service, headers, thread_id, reply_body, pdf_attachment=pdf_attachment, pdf_filename=pdf_filename)
 
 
 @tool()
