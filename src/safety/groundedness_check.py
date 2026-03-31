@@ -53,8 +53,24 @@ async def check_agent_groundedness(
         await ctx.send_message(retriever_response)
         return
 
-    # Current evaluator expects plain strings, not message lists.
-    response_text = json.dumps(retrieved_po.model_dump(), ensure_ascii=False)
+    # Build a focused response for the evaluator: only the fields that represent
+    # conclusions drawn FROM the search results. Exclude retrieval_evidence (it's
+    # already the context), and exclude computed totals (tax, shipping, order_total,
+    # subtotals) — those are derived math, not claims about the source documents.
+    _EXCLUDE = {
+        "retrieval_evidence",  # same as context — including it confuses the evaluator
+        "tax", "shipping", "subtotal", "order_total",  # computed, not in search docs
+        "customer_available_credit", "customer_can_order_with_credit",  # derived
+    }
+    response_data = {
+        k: v for k, v in retrieved_po.model_dump().items() if k not in _EXCLUDE
+    }
+    _ITEM_EXCLUDE = {"subtotal", "product_in_stock"}
+    response_data["items"] = [
+        {k: v for k, v in item.items() if k not in _ITEM_EXCLUDE}
+        for item in response_data.get("items", [])
+    ]
+    response_text = json.dumps(response_data, ensure_ascii=False)
     
     # Build query from captured search queries
     query_text = " | ".join(search_queries) if search_queries else f"PO {po_number} retrieval"
