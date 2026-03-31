@@ -211,23 +211,33 @@ class AgentCaptureMiddleware(AgentMiddleware):
             "complete for agent '{}' | Duration: {}ms",
             agent_name, duration_ms)
 
-        # Safely extract the agent's final result if it's of type AgentResponse
-        ctx_result = context.result if isinstance(context.result, AgentResponse) else None
-        
-        # If there's no result, log an error and raise an exception to catch it early
-        if not ctx_result:
+        # Safely extract the agent's final result
+        raw_result = context.result
+
+        # If there's no result at all, log an error and raise
+        if raw_result is None:
             logger.opt(colors=True).error(
                 "<magenta>[AgentCaptureMiddleware]</magenta> Agent '{}' "
                 "finished with no result! Exiting logging.",
                 agent_name)
             raise ValueError("Agent finished with no results!")
-        
-        # Serialize the agent's result to a formatted JSON string for logging
-        agent_result = json.dumps(
-            ctx_result.to_dict(),  # to_dict() converts it to dict so we can serialize it
-            indent=3,
-            ensure_ascii=False
-    )
+
+        # Serialize: AgentResponse has to_dict(); structured-output Pydantic models have model_dump()
+        if isinstance(raw_result, AgentResponse):
+            ctx_result = raw_result
+            agent_result = json.dumps(
+                ctx_result.to_dict(),
+                indent=3,
+                ensure_ascii=False,
+            )
+        elif hasattr(raw_result, "model_dump"):
+            agent_result = json.dumps(
+                _to_loggable(raw_result.model_dump()),
+                indent=3,
+                ensure_ascii=False,
+            )
+        else:
+            agent_result = json.dumps(_to_loggable(raw_result), indent=3, ensure_ascii=False)
 
         # Serialize agent's context.messages: extract role & text from each ChatMessage
         agent_messages_list = [
