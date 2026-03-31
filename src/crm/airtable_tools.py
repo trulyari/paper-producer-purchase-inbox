@@ -11,7 +11,7 @@ from typing import Any
 from dotenv import load_dotenv
 from loguru import logger
 
-from agent_framework import ai_function
+from agent_framework import tool
 
 # ============================================================================
 # ENVIRONMENT CONFIGURATION
@@ -151,7 +151,7 @@ def get_all_customers() -> list[dict[str, Any]]:
 # WRITE OPERATIONS (create new records)
 # ============================================================================
 
-@ai_function
+@tool
 def add_new_customer(
         customer_name: str,
         customer_email: str,
@@ -198,7 +198,7 @@ def add_new_customer(
     }
 
 
-@ai_function
+@tool
 def update_inventory(
         ordered_qty: int,
         product_sku: str,
@@ -245,7 +245,7 @@ def update_inventory(
     }
 
 
-@ai_function
+@tool
 def update_customer_credit(
         customer_id: str,
         order_amount: float,

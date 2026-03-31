@@ -15,6 +15,7 @@ google-api-python-client
 # Azure SDK libraries
 azure-identity
 agent-framework
+agent-framework-devui
 azure-storage-blob
 azure-search-documents
 azure-ai-contentsafety

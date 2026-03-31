@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from agent_framework import ChatAgent
+from agent_framework import Agent
 from pydantic import BaseModel, ConfigDict, Field
 
 from agents.base import chat_client
@@ -72,8 +72,8 @@ class ParsedPO(BaseModel):
     ]
 
 
-parser = ChatAgent(
-    chat_client=chat_client,
+parser = Agent(
+    client=chat_client,
     name="parser",
     instructions=(
         "You are a purchase order parsing specialist for a paper company. "
@@ -121,5 +121,5 @@ parser = ChatAgent(
         check_email_prompt_injection,
         check_email_content_safety,
     ],
-    response_format=ParsedPO,
+    default_options={"response_format": ParsedPO},
 )

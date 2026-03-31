@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from agent_framework import ChatAgent
+from agent_framework import Agent
 from pydantic import BaseModel, ConfigDict, Field
 
 from emailing.gmail_tools import get_unread_emails
@@ -13,6 +13,8 @@ class Email(BaseModel):
     id: Annotated[str, Field(description="Gmail message ID for this email")]
     subject: Annotated[str, Field(description="Email subject line as received")]
     sender: Annotated[str, Field(description="Email address of the sender")]
+    snippet: Annotated[str, Field(
+        description="Gmail snippet preview for the email")] = ""
     body: Annotated[str, Field(
         description="Plaintext body content of the email")]
 
@@ -26,8 +28,8 @@ class ClassifiedEmail(BaseModel):
         description="Brief classifier rationale supporting the decision")]
 
 
-classifier = ChatAgent(
-    chat_client=chat_client,
+classifier = Agent(
+    client=chat_client,
     name="classifier",
     instructions=(
         "You are the inbox triage specialist. "
@@ -49,5 +51,5 @@ classifier = ChatAgent(
     tools=[
         get_unread_emails,
     ],
-    response_format=ClassifiedEmail,
+    default_options={"response_format": ClassifiedEmail},
 )

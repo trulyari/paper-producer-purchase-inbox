@@ -13,7 +13,7 @@ src/agents/prompts
 docs
 logs/*
 *.backup
-
+artifacts/invoices/*
 
 # Terraform files to ignore (under ./infra/):
 # *.tfvars   # normally used to store sensitive variables, uncomment if needed

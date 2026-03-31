@@ -1,6 +1,6 @@
 from typing import Any, Annotated
 
-from agent_framework import ChatAgent, ai_function
+from agent_framework import Agent, tool
 from pydantic import BaseModel, ConfigDict, Field
 
 from invoice.invoice_tools import generate_invoice_pdf_url
@@ -22,11 +22,11 @@ from aisearch.azure_search_tools import (
 )
 
 
-@ai_function
+@tool
 def send_confirmation_email_with_approval(
     message_id: str,
-    invoice_url: str,
-    retrieved_po: dict[str, Any],
+    invoice_url: str | None = None,
+    retrieved_po: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Get human approval via Slack, then send confirmation email if approved.
     
@@ -37,7 +37,7 @@ def send_confirmation_email_with_approval(
     Args:
         message_id: Gmail message ID to reply to.
         invoice_url: The generated invoice URL to include in confirmation.
-        retrieved_po: The enriched PO data (required for approval display).
+        retrieved_po: The enriched PO data for the Slack approval summary.
         
     Returns:
         Dictionary with approval status and whether email was sent.
@@ -45,8 +45,15 @@ def send_confirmation_email_with_approval(
     import os
     
     # Step 1: Post order to Slack and get thread timestamp
+    approval_payload = retrieved_po or {
+        "customer_name": "Unknown Customer",
+        "order_total": 0.0,
+        "items": [],
+        "po_number": message_id,
+    }
+
     try:
-        thread_ts = post_approval_request(retrieved_po)
+        thread_ts = post_approval_request(approval_payload)
     except Exception as e:
         return {
             "status": "error",
@@ -67,7 +74,7 @@ def send_confirmation_email_with_approval(
         try:
             respond_confirmation_email(
                 message_id=message_id,
-                pdf_url=invoice_url,
+                pdf_url=invoice_url or None,
             )
             return {
                 "status": "approved",
@@ -90,6 +97,12 @@ def send_confirmation_email_with_approval(
 
 class FulfillmentResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    email_id: Annotated[
+        str,
+        Field(
+            description="The Gmail message ID that was processed",
+        ),
+    ]
     ok: Annotated[
         bool,
         Field(
@@ -110,8 +123,8 @@ class FulfillmentResult(BaseModel):
     ]
 
 
-fulfiller = ChatAgent(
-     chat_client=chat_client,
+fulfiller = Agent(
+     client=chat_client,
      name="fulfiller",
      instructions=(
           """You are the fulfillment executor for purchase orders marked FULFILLABLE.
@@ -123,12 +136,14 @@ CRITICAL: You MUST execute ALL steps in order. Do NOT skip steps. Do NOT return 
 STEP 1 - Customer setup (if needed):
    • Check if customer_id equals 'NEW' or similar placeholder
    • If yes: call add_new_customer(customer_name, customer_email, customer_address)
+   • Store the returned customer_id and use THAT new ID for any later credit update
    • Then call ingest_customers_from_airtable()
    • Continue to STEP 2
 
 STEP 2 - Generate invoice:
    • Call generate_invoice_pdf_url(order_context=input_payload)
    • Store the returned URL string as invoice_url
+   • If the function returns an empty string, continue anyway: it means the PDF was generated locally but cloud upload was unavailable
    • Continue to STEP 3
 
 STEP 3 - Request human approval and send email:
@@ -153,6 +168,7 @@ STEP 4 - Update inventory and credit (ONLY if approved in STEP 3):
 
 STEP 5 - Return result:
    • Construct FulfillmentResult with:
+     - email_id: input_payload.email_id exactly, unchanged
      - ok: True ONLY if STEP 3 was approved AND STEP 4 completed successfully
      - order_id: input_payload.po_number
      - invoice_no: input_payload.po_number (use as invoice number)
@@ -169,5 +185,5 @@ Do NOT return FulfillmentResult until you have executed STEPS 1-4 completely."""
           update_customer_credit,
           ingest_products_from_airtable,
      ],
-     response_format=FulfillmentResult,
+     default_options={"response_format": FulfillmentResult},
 )

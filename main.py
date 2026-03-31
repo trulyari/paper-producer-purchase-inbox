@@ -3,6 +3,7 @@
 import asyncio
 
 from src.shared.logging_config import configure_logging
+from src.workflow import workflow
 from src.workflow.workflow import (
     run_till_mail_read,  # Import the async function to run the workflow
 )
@@ -19,8 +20,8 @@ def main() -> None:
     ################################# DevUI ###################################
 
     # # UNCOMMENT BELOW TWO LINES to start the DevUI to visualize the workflow:
-    # from agent_framework_devui import serve  # serve means to start the dev UI
-    # serve([workflow], auto_open=True)  # Automatically open the UI in a browser
+    from agent_framework_devui import serve  # serve means to start the dev UI
+    serve(entities=[workflow], auto_open=True)  # Automatically open the UI in a browser
 
 
 if __name__ == "__main__":

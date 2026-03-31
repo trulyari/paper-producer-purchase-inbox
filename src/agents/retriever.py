@@ -1,7 +1,7 @@
 from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from agent_framework import ChatAgent
+from agent_framework import Agent
 
 from agents.base import chat_client
 from agents.middleware_tools import search_evidence
@@ -183,8 +183,8 @@ class RetrievedPO(BaseModel):
         return self
 
 
-retriever = ChatAgent(
-    chat_client=chat_client,
+retriever = Agent(
+    client=chat_client,
     name="retriever",
     instructions=(
         "You are an order enrichment specialist. Given a ParsedPO containing customer details and line items, "
@@ -213,5 +213,5 @@ retriever = ChatAgent(
         search_customers,                # search tool for customer lookup
         search_products,                 # search tool for product lookup
     ],
-    response_format=RetrievedPO,
+    default_options={"response_format": RetrievedPO},
 )

@@ -4,12 +4,12 @@ import requests
 from loguru import logger
 
 from azure.identity import DefaultAzureCredential
-from agent_framework import ai_function
+from agent_framework import tool
 
 load_dotenv()
 
 
-@ai_function
+@tool
 def check_email_prompt_injection(email_body: str) -> dict:
     """
     Check if the email text contains prompt injection attack patterns using Azure Content Safety.

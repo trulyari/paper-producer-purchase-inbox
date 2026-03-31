@@ -5,12 +5,12 @@ from loguru import logger
 from azure.ai.contentsafety import ContentSafetyClient
 from azure.ai.contentsafety.models import AnalyzeTextOptions
 from azure.identity import DefaultAzureCredential
-from agent_framework import ai_function
+from agent_framework import tool
 
 load_dotenv()
 
 
-@ai_function
+@tool
 def check_email_content_safety(email_body: str, threshold: int = 4) -> dict:
     """
     Check if email text contains harmful content (Hate, Self-Harm, Sexual, Violence).

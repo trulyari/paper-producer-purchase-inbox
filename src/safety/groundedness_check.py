@@ -32,7 +32,7 @@ async def check_agent_groundedness(
     """
     from agents.middleware_tools import search_queries
     
-    retrieved_po = retriever_response.agent_run_response.value
+    retrieved_po = retriever_response.agent_response.value
     po_number = getattr(retrieved_po, 'po_number', 'UNKNOWN')
     
     logger.info(f"[Groundedness Check] Starting validation for PO: {po_number}")
@@ -46,14 +46,15 @@ async def check_agent_groundedness(
     
     # Get evidence documents
     retrieval_evidence = getattr(retrieved_po, 'retrieval_evidence', [])
-    
-    # Format response as OpenAI message (SDK expects this format)
-    agent_response = [
-        {
-            "role": "assistant",
-            "content": json.dumps(retrieved_po.model_dump()),
-        }
-    ]
+    if not retrieval_evidence:
+        reason = "No retrieval evidence captured for groundedness evaluation"
+        logger.warning("[Groundedness Check] {} | po_number={}", reason, po_number)
+        _attach_failure_metadata(retriever_response, reason)
+        await ctx.send_message(retriever_response)
+        return
+
+    # Current evaluator expects plain strings, not message lists.
+    response_text = json.dumps(retrieved_po.model_dump(), ensure_ascii=False)
     
     # Build query from captured search queries
     query_text = " | ".join(search_queries) if search_queries else f"PO {po_number} retrieval"
@@ -70,12 +71,23 @@ async def check_agent_groundedness(
     )
     
     context = "\n\n".join(retrieval_evidence)
-
-    result = evaluator(
-        query=query_text,  
-        response=agent_response,
-        context=context,
-    )
+    try:
+        result = evaluator(
+            query=query_text,
+            response=response_text,
+            context=context,
+        )
+    except Exception as exc:
+        logger.exception(
+            "[Groundedness Check] Evaluator call failed for PO {}",
+            po_number,
+        )
+        _attach_failure_metadata(
+            retriever_response,
+            f"Groundedness evaluator failed: {exc}",
+        )
+        await ctx.send_message(retriever_response)
+        return
     
     # Simple pass/fail check
     result_label = str(result.get("groundedness_result", "")).strip().lower()
@@ -95,10 +107,10 @@ async def check_agent_groundedness(
 
 def _attach_success_metadata(response: AgentExecutorResponse, result: dict) -> None:
     """Attach pass metadata to response."""
-    if response.agent_run_response.additional_properties is None:
-        response.agent_run_response.additional_properties = {}
+    if response.agent_response.additional_properties is None:
+        response.agent_response.additional_properties = {}
     
-    response.agent_run_response.additional_properties.update({
+    response.agent_response.additional_properties.update({
         "is_grounded_result": True,
         "groundedness_score": int(result.get("groundedness", 5)),
         "groundedness_reason": str(result.get("groundedness_reason", "Passed")),
@@ -107,10 +119,10 @@ def _attach_success_metadata(response: AgentExecutorResponse, result: dict) -> N
 
 def _attach_failure_metadata(response: AgentExecutorResponse, reason: str) -> None:
     """Attach fail metadata to response."""
-    if response.agent_run_response.additional_properties is None:
-        response.agent_run_response.additional_properties = {}
+    if response.agent_response.additional_properties is None:
+        response.agent_response.additional_properties = {}
     
-    response.agent_run_response.additional_properties.update({
+    response.agent_response.additional_properties.update({
         "is_grounded_result": False,
         "groundedness_score": 0,
         "groundedness_reason": reason,

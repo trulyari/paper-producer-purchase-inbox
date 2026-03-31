@@ -7,6 +7,8 @@ Data sourced from Airtable via airtable_tools module.
 # Add parent directory to path for module imports
 import sys
 import os
+import re
+import unicodedata
 from loguru import logger
 
 # Add parent to path so that crm.airtable_tools can be imported correctly?
@@ -14,6 +16,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 # Airtable data fetchers
 import json  # For JSON parsing
+from difflib import SequenceMatcher
 from functools import lru_cache  # cache function results to optimize performance
 from typing import Any, Sequence  # Any: generic type, Sequence: list/tuple
 from dotenv import load_dotenv
@@ -22,7 +25,7 @@ from dotenv import load_dotenv
 from crm.airtable_tools import get_all_products, get_all_customers
 
 # Agent framework decorator, for AI function registration
-from agent_framework import AgentExecutorResponse, WorkflowContext, ai_function, executor
+from agent_framework import AgentExecutorResponse, WorkflowContext, executor, tool
 
 # Azure SDK imports
 from azure.identity import DefaultAzureCredential  # Managed identity auth
@@ -359,7 +362,7 @@ def _customer_fields() -> list[SearchField]:
 # INDEX SCHEMA CREATION
 # ============================================================================
 
-@ai_function
+@tool
 def create_products_index_schema() -> dict[str, Any]:
     """
     Creates or updates the products search index schema.
@@ -388,7 +391,7 @@ def create_products_index_schema() -> dict[str, Any]:
 
 
 
-@ai_function
+@tool
 def create_customer_index_schema() -> dict[str, Any]:
     """
     Creates or updates the customers search index schema.
@@ -441,7 +444,103 @@ def _upload_documents_to_index(
     search_client.upload_documents(documents=documents)  # Batch upload
 
 
-@ai_function
+def _normalize_text(value: Any) -> str:
+    """Normalize free text for lightweight fallback matching."""
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = text.encode("ascii", "ignore").decode("ascii").lower()
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def _score_match(query: str, *values: Any) -> float:
+    """Return a simple overlap/fuzzy score for local fallback search."""
+    normalized_query = _normalize_text(query)
+    if not normalized_query:
+        return 0.0
+
+    combined = " ".join(_normalize_text(value) for value in values if value)
+    if not combined:
+        return 0.0
+
+    query_tokens = set(normalized_query.split())
+    combined_tokens = set(combined.split())
+    overlap_score = len(query_tokens & combined_tokens) * 3.0
+    substring_bonus = 8.0 if normalized_query in combined else 0.0
+    fuzzy_score = SequenceMatcher(None, normalized_query, combined).ratio() * 5.0
+    return overlap_score + substring_bonus + fuzzy_score
+
+
+def _search_customers_from_airtable(query: str, top: int = 3) -> list[dict[str, Any]]:
+    """Fallback customer lookup when Azure Search data-plane access is unavailable."""
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    minimum_score = 3.0
+
+    for record in get_all_customers():
+        fields = record.get("fields", {})
+        result = {
+            "customerId": fields.get("Customer ID", ""),
+            "companyName": fields.get("Name", ""),
+            "email": fields.get("Email", ""),
+            "creditLimit": float(fields.get("Credit Limit", 0) or 0),
+            "openAR": float(fields.get("Open AR", 0) or 0),
+            "status": fields.get("Status", ""),
+            "billingAddress": fields.get("Billing Address", ""),
+            "shippingAddress": fields.get("Shipping Address", ""),
+        }
+        score = _score_match(
+            query,
+            result["customerId"],
+            result["companyName"],
+            result["email"],
+            result["billingAddress"],
+            result["shippingAddress"],
+        )
+        ranked.append((score, result))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [result for score, result in ranked if score >= minimum_score][:top]
+
+
+def _search_products_from_airtable(query: str, top: int = 5) -> list[dict[str, Any]]:
+    """Fallback product lookup when Azure Search data-plane access is unavailable."""
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    minimum_score = 3.0
+
+    for record in get_all_products():
+        fields = record.get("fields", {})
+        attrs = json.loads(fields.get("Attributes JSON", "{}") or "{}")
+        result = {
+            "sku": fields.get("SKU", ""),
+            "title": fields.get("Title", ""),
+            "description": fields.get("Description", ""),
+            "size": attrs.get("size"),
+            "gsm": int(attrs.get("gsm", 0) or 0),
+            "finish": attrs.get("finish"),
+            "color": attrs.get("color"),
+            "uom": fields.get("UOM"),
+            "unitPrice": float(fields.get("Unit Price", 0) or 0),
+            "qtyAvailable": int(fields.get("Qty Available", 0) or 0),
+            "active": bool(fields.get("Active", False)),
+        }
+        if not result["active"]:
+            continue
+
+        score = _score_match(
+            query,
+            result["sku"],
+            result["title"],
+            result["description"],
+            result["size"],
+            result["gsm"],
+            result["finish"],
+            result["color"],
+        )
+        ranked.append((score, result))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [result for score, result in ranked if score >= minimum_score][:top]
+
+
+@tool
 def ingest_products_from_airtable() -> dict[str, Any]:
     """
     Fetches product data from Airtable and uploads to products index.
@@ -501,7 +600,20 @@ def ingest_products_from_airtable() -> dict[str, Any]:
 
         documents.append(doc)
 
-    _upload_documents_to_index(INDEX_NAME_PRODUCTS, documents)  # Batch upload
+    try:
+        _upload_documents_to_index(INDEX_NAME_PRODUCTS, documents)  # Batch upload
+    except Exception as exc:
+        logger.warning(
+            "[FUNCTION ingest_products_from_airtable] Azure Search upload failed; "
+            "continuing with Airtable-only fallback | error={}",
+            exc,
+        )
+        return {
+            "status": "fallback_only",
+            "index": INDEX_NAME_PRODUCTS,
+            "ingested_docs_count": len(documents),
+            "error": str(exc),
+        }
 
     logger.info(
         "[FUNCTION ingest_products_from_airtable] ✓ Ingested {} documents from "
@@ -515,7 +627,7 @@ def ingest_products_from_airtable() -> dict[str, Any]:
             "ingested_docs_count": len(documents)}
 
 
-@ai_function
+@tool
 def ingest_customers_from_airtable() -> dict[str, Any]:
     """
     Fetches customer data from Airtable and uploads to customers index.
@@ -556,7 +668,20 @@ def ingest_customers_from_airtable() -> dict[str, Any]:
 
         documents.append(doc)
 
-    _upload_documents_to_index(INDEX_NAME_CUSTOMERS, documents)  # Batch upload
+    try:
+        _upload_documents_to_index(INDEX_NAME_CUSTOMERS, documents)  # Batch upload
+    except Exception as exc:
+        logger.warning(
+            "[FUNCTION ingest_customers_from_airtable] Azure Search upload failed; "
+            "continuing with Airtable-only fallback | error={}",
+            exc,
+        )
+        return {
+            "status": "fallback_only",
+            "index": INDEX_NAME_CUSTOMERS,
+            "ingested_docs_count": len(documents),
+            "error": str(exc),
+        }
 
     logger.info(
         "[FUNCTION ingest_customers_from_airtable] ✓ Ingested {} documents from "
@@ -566,8 +691,8 @@ def ingest_customers_from_airtable() -> dict[str, Any]:
     )
 
     return {"status": "ingested",
-            "ingested_docs_count": INDEX_NAME_CUSTOMERS,
-            "count": len(documents)}
+            "index": INDEX_NAME_CUSTOMERS,
+            "ingested_docs_count": len(documents)}
 
 
 # ============================================================================
@@ -608,7 +733,7 @@ def _semantic_and_hybrid_search(
 
     vector_query = VectorizableTextQuery(
         text=query_text,
-        k_nearest_neighbors=top,
+        k=top,
         fields=vector_field,
     )
 
@@ -655,23 +780,30 @@ def _search_customers(
             INDEX_NAME_CUSTOMERS
     )
 
-    return _semantic_and_hybrid_search(
-        INDEX_NAME_CUSTOMERS,
-        query,
-        top=top,
-        # query_language=query_language,
-        select=[
-            "customerId",
-            "companyName",
-            "email",
-            "creditLimit",
-            "openAR",
-            "status",
-            "billingAddress",
-            "shippingAddress",
-        ],
-        semantic_config="customers-semantic-config",
-    )
+    try:
+        return _semantic_and_hybrid_search(
+            INDEX_NAME_CUSTOMERS,
+            query,
+            top=top,
+            select=[
+                "customerId",
+                "companyName",
+                "email",
+                "creditLimit",
+                "openAR",
+                "status",
+                "billingAddress",
+                "shippingAddress",
+            ],
+            semantic_config="customers-semantic-config",
+        )
+    except Exception as exc:
+        logger.warning(
+            "[FUNCTION search_customers] Azure Search lookup failed; "
+            "falling back to Airtable matching | error={}",
+            exc,
+        )
+        return _search_customers_from_airtable(query, top=top)
     
 
 def _search_products(
@@ -696,35 +828,42 @@ def _search_products(
         INDEX_NAME_PRODUCTS,
     )
 
-    return _semantic_and_hybrid_search(
-        INDEX_NAME_PRODUCTS,
-        query,
-        top=top,
-        # query_language=query_language,
-        filter="active eq true",
-        select=[
-            "sku",
-            "title",
-            "description",
-            "size",
-            "gsm",
-            "finish",
-            "color",
-            "uom",
-            "unitPrice",
-            "qtyAvailable",
-            "active",
-        ],
-        semantic_config="products-semantic-config",
-    )
+    try:
+        return _semantic_and_hybrid_search(
+            INDEX_NAME_PRODUCTS,
+            query,
+            top=top,
+            filter="active eq true",
+            select=[
+                "sku",
+                "title",
+                "description",
+                "size",
+                "gsm",
+                "finish",
+                "color",
+                "uom",
+                "unitPrice",
+                "qtyAvailable",
+                "active",
+            ],
+            semantic_config="products-semantic-config",
+        )
+    except Exception as exc:
+        logger.warning(
+            "[FUNCTION search_products] Azure Search lookup failed; "
+            "falling back to Airtable matching | error={}",
+            exc,
+        )
+        return _search_products_from_airtable(query, top=top)
 
 
-# IMPORTANT: Register search functions as AI functions for agent use!
+# IMPORTANT: Register search functions as tools for agent use!
 # We couldn't decorate the internal functions directly because
 # they have parameters that was giving issues with type checking.
-# So we wrap them in these ai_function-decorated functions.
-search_customers = ai_function(_search_customers)
-search_products = ai_function(_search_products)
+# So we wrap them in these tool-decorated functions.
+search_customers = tool(_search_customers)
+search_products = tool(_search_products)
 
 
 # Executor func to delete both indexes from Azure AI Search at the end of workflow
@@ -735,17 +874,25 @@ def destroy_indexes(
     ctx: WorkflowContext[AgentExecutorResponse],
 ) -> AgentExecutorResponse:
     """Deletes both products and customers indexes from Azure AI Search."""
-    _ = upstream_agent_response.agent_run_response.value  # Unused parameter
-    
-    INDEX_CLIENT.delete_index(INDEX_NAME_PRODUCTS)
-    INDEX_CLIENT.delete_index(INDEX_NAME_CUSTOMERS)
-    
-    logger.info(
-        "[FUNCTION destroy_indexes] ✓ Deleted the indexes '{}' and '{}' "
-        "from Azure AI Search!",
-        INDEX_NAME_PRODUCTS,
-        INDEX_NAME_CUSTOMERS
-    )
+    _ = upstream_agent_response.agent_response.value  # Unused parameter
+
+    deleted_indexes: list[str] = []
+    for index_name in (INDEX_NAME_PRODUCTS, INDEX_NAME_CUSTOMERS):
+        try:
+            INDEX_CLIENT.delete_index(index_name)
+            deleted_indexes.append(index_name)
+        except Exception as exc:
+            logger.warning(
+                "[FUNCTION destroy_indexes] Skipping delete for index '{}' | error={}",
+                index_name,
+                exc,
+            )
+
+    if deleted_indexes:
+        logger.info(
+            "[FUNCTION destroy_indexes] ✓ Deleted indexes from Azure AI Search: {}",
+            ", ".join(deleted_indexes),
+        )
 
     __ = ctx  # Unused parameter
     return upstream_agent_response

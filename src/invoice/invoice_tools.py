@@ -11,9 +11,9 @@ from dotenv import load_dotenv
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from weasyprint import HTML
 
-from agent_framework import ai_function
+from agent_framework import tool
 from azure.core.exceptions import ResourceExistsError
-from azure.identity import DefaultAzureCredential
+from azure.identity import AzureCliCredential, DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
 load_dotenv()
@@ -33,18 +33,26 @@ def transform_retrieved_po_to_invoice_context(retrieved_po: dict) -> dict:
     # Extract customer info from first item or use retrieved_po level fields
     first_item = items_list[0] if items_list else {}
     
+    shipping_address = (
+        retrieved_po.get("customer_shipping_address")
+        or first_item.get("customer_address")
+        or first_item.get("matched_customer_address")
+        or "N/A"
+    )
+    billing_address = retrieved_po.get("customer_billing_address") or shipping_address
+
     return {
         "customer": {
             "company": retrieved_po.get("customer_name", "N/A"),
-            "contact": first_item.get("matched_customer_name", retrieved_po.get("customer_name", "N/A")),
-            "email": "customer@example.com",  # Not in schema, use placeholder
-            "address1": first_item.get("matched_customer_address", "N/A"),
-            "address2": None,
+            "contact": retrieved_po.get("customer_name", "N/A"),
+            "email": retrieved_po.get("customer_email", "customer@example.com"),
+            "address1": shipping_address,
+            "address2": billing_address if billing_address != shipping_address else None,
         },
         "payment": {
             "terms": "Net 30",
             "method": "Bank transfer",
-            "po_number": retrieved_po.get("email_id", "N/A"),
+            "po_number": retrieved_po.get("po_number", retrieved_po.get("email_id", "N/A")),
         },
         "items": [
             {
@@ -106,7 +114,53 @@ def _ensure_invoice_metadata(order_context: dict[str, Any]) -> dict[str, Any]:
     context["invoice"] = invoice_block
     return context
 
-@ai_function
+
+def _looks_like_connection_string(value: str | None) -> bool:
+    """Return True only for actual Azure Storage connection strings."""
+    if not value:
+        return False
+    return (
+        "DefaultEndpointsProtocol=" in value
+        or "AccountKey=" in value
+        or "SharedAccessSignature=" in value
+    )
+
+
+def _write_local_invoice_copy(pdf_content: bytes, invoice_number: str) -> Path:
+    """Persist a local invoice file when Blob upload is unavailable."""
+    output_dir = Path(__file__).resolve().parents[2] / "artifacts" / "invoices"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{invoice_number}-{int(time.time())}.pdf"
+    output_path.write_bytes(pdf_content)
+    return output_path
+
+
+def _build_blob_service_client() -> BlobServiceClient:
+    """Build a Blob client from either a real connection string or Azure AD auth."""
+    account_url = os.getenv("AZURE_STORAGE_ACCOUNT_URL")
+    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+
+    if _looks_like_connection_string(connection_string):
+        return BlobServiceClient.from_connection_string(connection_string)
+
+    if not account_url:
+        raise ValueError(
+            "Set AZURE_STORAGE_ACCOUNT_URL for Azure AD auth, or provide a real "
+            "AZURE_STORAGE_CONNECTION_STRING for local development."
+        )
+
+    try:
+        return BlobServiceClient(
+            account_url=account_url,
+            credential=AzureCliCredential(),
+        )
+    except Exception:
+        return BlobServiceClient(
+            account_url=account_url,
+            credential=DefaultAzureCredential(),
+        )
+
+@tool
 def generate_invoice_pdf_url(
     order_context: dict,
     html_template: str | Path | None = None,
@@ -141,43 +195,37 @@ def generate_invoice_pdf_url(
 
     logger.info("[FUNCTION generate_invoice_pdf_url] Uploading invoice PDF file to Azure Blob Storage...")
 
-    account_url = os.getenv("AZURE_STORAGE_ACCOUNT_URL")
-    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
     container_name = os.getenv("AZURE_INVOICE_CONTAINER", "invoices")
-
-    if account_url:
-        # Managed identity path (Container Apps / other Azure hosts)
-        blob_service = BlobServiceClient(
-            account_url=account_url,
-            credential=DefaultAzureCredential(),
-        )
-    elif connection_string:
-        # Local development fallback when you only have a connection string
-        blob_service = BlobServiceClient.from_connection_string(connection_string)
-    else:
-        raise ValueError(
-            "Set AZURE_STORAGE_ACCOUNT_URL for managed identity, "
-            "or AZURE_STORAGE_CONNECTION_STRING for local development."
-        )
+    invoice_number = str(order_context_with_invoice["invoice"]["number"])
 
     blob_name = f"{template_path.stem}-{int(time.time())}.pdf"
-    container_client = blob_service.get_container_client(container_name)
-
     try:
-        container_client.create_container()
-    except ResourceExistsError:
-        pass
+        blob_service = _build_blob_service_client()
+        container_client = blob_service.get_container_client(container_name)
 
-    blob_client = container_client.get_blob_client(blob_name)
-    blob_client.upload_blob(
-        pdf_content,
-        overwrite=True,
-        content_settings=ContentSettings(content_type="application/pdf"),
-    )
+        try:
+            container_client.create_container()
+        except ResourceExistsError:
+            pass
 
-    logger.info("[FUNCTION generate_invoice_pdf_url] Invoice PDF uploaded successfully!")
+        blob_client = container_client.get_blob_client(blob_name)
+        blob_client.upload_blob(
+            pdf_content,
+            overwrite=True,
+            content_settings=ContentSettings(content_type="application/pdf"),
+        )
 
-    return blob_client.url
+        logger.info("[FUNCTION generate_invoice_pdf_url] Invoice PDF uploaded successfully!")
+        return blob_client.url
+    except Exception as exc:
+        local_path = _write_local_invoice_copy(pdf_content, invoice_number)
+        logger.warning(
+            "[FUNCTION generate_invoice_pdf_url] Blob upload unavailable; "
+            "saved invoice locally instead | path={} | error={}",
+            local_path,
+            exc,
+        )
+        return ""
 
 
     

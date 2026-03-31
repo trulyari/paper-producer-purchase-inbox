@@ -11,12 +11,12 @@ from loguru import logger
 import time
 
 from agent_framework import (
-    AgentRunResponse,
-    ChatAgent,  # Represents the response to an Agent run request
+    Agent,
+    AgentResponse,
     FunctionInvocationContext,  # Context passed to middleware during function/tool calls 
     FunctionMiddleware,  # Base class for creating function call middleware
     AgentMiddleware,  # Base class for agent-level middleware that hooks into agent lifecycle events
-    AgentRunContext,  # Context passed to middleware during agent runs that includes run-specific data
+    AgentContext,  # Context passed to middleware during agent runs that includes run-specific data
 )
 
 # Global list to store serialized search evidence across agents (retriever, fact-checker)
@@ -35,6 +35,33 @@ def clear_evidence() -> None:
     so each workflow run starts clean, without old data."""
     search_evidence.clear()
     search_queries.clear()
+
+
+def _to_loggable(value: Any) -> Any:
+    """Recursively convert framework objects into JSON-safe debug payloads."""
+
+    if hasattr(value, "to_dict"):
+        try:
+            return _to_loggable(value.to_dict())
+        except Exception:
+            return repr(value)
+
+    if hasattr(value, "model_dump"):
+        try:
+            return _to_loggable(value.model_dump())
+        except Exception:
+            return repr(value)
+
+    if isinstance(value, dict):
+        return {str(key): _to_loggable(item) for key, item in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [_to_loggable(item) for item in value]
+
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+
+    return repr(value)
 
 
 def _record_search_payload(tool_name: str, arguments: Any, payload: Any) -> None:
@@ -67,14 +94,16 @@ def _record_search_payload(tool_name: str, arguments: Any, payload: Any) -> None
 
     for doc in docs:
         try:
-            search_evidence.append(json.dumps(doc, ensure_ascii=False))
+            search_evidence.append(
+                json.dumps(_to_loggable(doc), ensure_ascii=False)
+            )
         except TypeError as exc:  # Rough logging so we can spot failures fast.
             logger.warning("Skipping evidence serialization for '{}': {}",
                            tool_name, exc)
 
 
 # Helper to attach the middleware to multiple agents at once:
-def attach_middlewares(*agents: ChatAgent) -> None:
+def attach_middlewares(*agents: Agent) -> None:
     """Add the capture middleware to each agent once (idempotent helper).
     It checks if the middleware is already present in each agent to avoid duplicates.
     
@@ -106,8 +135,8 @@ class ToolCaptureMiddleware(FunctionMiddleware):
     async def process(
         self,
         context: FunctionInvocationContext,  # tool call context (name, args, result etc.)
-        next: Callable[[FunctionInvocationContext],
-                       Awaitable[None]],  # The next middleware/tool in the chain
+        call_next: Callable[[],
+                            Awaitable[None]],  # The next middleware/tool in the chain
     ) -> None:
         """Middleware that runs at the tool/function level to log tool calls & capture results"""
 
@@ -119,7 +148,7 @@ class ToolCaptureMiddleware(FunctionMiddleware):
                     "started! Calling the function: '{}'",
                     tool_name)
         
-        await next(context)  # Let the underlying tool run normally first.
+        await call_next()  # Let the underlying tool run normally first.
         
         # Calculate execution time
         duration_ms = (time.perf_counter() - start_time) * 1000
@@ -132,9 +161,9 @@ class ToolCaptureMiddleware(FunctionMiddleware):
 
         # NOW, get the function result after the tool has executed
         tool_result = json.dumps(
-            context.result if context.result else {},
+            _to_loggable(context.result if context.result else {}),
             indent=3,
-            ensure_ascii=False
+            ensure_ascii=False,
         )
 
         tool_arguments = context.arguments # Get the tool's input arguments
@@ -160,9 +189,9 @@ class AgentCaptureMiddleware(AgentMiddleware):
     async def process(
         self,
         # context passed in agent midware pipeline w all info about agent invocation:
-        context: AgentRunContext,
-        next: Callable[[AgentRunContext],
-                       Awaitable[None]],  # The next middleware/agent in the chain
+        context: AgentContext,
+        call_next: Callable[[],
+                            Awaitable[None]],  # The next middleware/agent in the chain
     ) -> None:
             
         agent_name = context.agent.name
@@ -173,7 +202,7 @@ class AgentCaptureMiddleware(AgentMiddleware):
                     "capture middleware starting execution for agent: '{}'",
                     agent_name)
 
-        await next(context)  # Let the agent run normally first.
+        await call_next()  # Let the agent run normally first.
 
         duration_ms = (time.perf_counter() - start_time) * 1000 
 
@@ -182,8 +211,8 @@ class AgentCaptureMiddleware(AgentMiddleware):
             "complete for agent '{}' | Duration: {}ms",
             agent_name, duration_ms)
 
-        # Safely extract the agent's final result if it's of type AgentRunResponse
-        ctx_result = context.result if isinstance(context.result, AgentRunResponse) else None
+        # Safely extract the agent's final result if it's of type AgentResponse
+        ctx_result = context.result if isinstance(context.result, AgentResponse) else None
         
         # If there's no result, log an error and raise an exception to catch it early
         if not ctx_result:

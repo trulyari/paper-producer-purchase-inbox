@@ -2,31 +2,48 @@ import shutil
 from dotenv import load_dotenv
 
 from agent_framework.azure import AzureOpenAIChatClient
-from agent_framework.observability import setup_observability
+from agent_framework.observability import configure_otel_providers
 from azure.identity import AzureCliCredential, DefaultAzureCredential
 
 # Ensure environment and telemetry are configured before agents initialize.
 load_dotenv()
-setup_observability()
+configure_otel_providers()
+
+COGNITIVE_SERVICES_SCOPE = "https://cognitiveservices.azure.com/.default"
+
+
+def _validate_credential(credential: DefaultAzureCredential | AzureCliCredential) -> None:
+    """Fail fast unless the credential can mint a Cognitive Services token."""
+
+    credential.get_token(COGNITIVE_SERVICES_SCOPE)
 
 
 def _build_chat_client() -> AzureOpenAIChatClient:
     """Create a chat client using the best available authentication."""
 
-    # Prefer non-CLI credentials to keep containers self-contained.
+    if shutil.which("az"):
+        try:
+            credential = AzureCliCredential()
+            _validate_credential(credential)
+            return AzureOpenAIChatClient(credential=credential)
+        except Exception:
+            pass
+
+    # Fall back to managed identity / service principal style credentials.
     try:
-        return AzureOpenAIChatClient(
-            credential=DefaultAzureCredential(exclude_cli_credential=True)
+        credential = DefaultAzureCredential(
+            exclude_cli_credential=True,
+            exclude_developer_cli_credential=True,
         )
+        _validate_credential(credential)
+        return AzureOpenAIChatClient(credential=credential)
     except Exception:
         pass
 
-    if shutil.which("az"):
-        return AzureOpenAIChatClient(credential=AzureCliCredential())
-
     raise RuntimeError(
-        "Azure authentication not configured. Set AZURE_OPENAI_API_KEY or install "
-        "Azure CLI inside the container and run `az login`."
+        "Azure authentication not configured. Set service principal environment "
+        "variables or run `az login` for the Azure subscription that owns the "
+        "Azure OpenAI resource."
     )
 
 

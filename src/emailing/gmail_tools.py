@@ -9,12 +9,13 @@ from email.utils import parseaddr
 from pathlib import Path
 from typing import Any, cast
 import os
+import re
 from loguru import logger
 
 from bs4 import BeautifulSoup  # For HTML parsing
 import base64  # For decoding email body content
 
-from agent_framework import ai_function
+from agent_framework import tool
 
 from google.auth.exceptions import RefreshError  # Raised when refresh fails
 from google.auth.transport.requests import Request  # For refreshing tokens
@@ -156,8 +157,18 @@ def _extract_body(part: dict) -> str:
     if "data" in part.get("body", {}):
         return base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="ignore")
     if "parts" in part:
-        return "\n".join(_extract_body(p) for p in part["parts"] if _extract_body(p))
+        extracted_parts = []
+        for subpart in part["parts"]:
+            content = _extract_body(subpart)
+            if content:
+                extracted_parts.append(content)
+        return "\n".join(extracted_parts)
     return ""
+
+
+def _sanitize_email_text(text: str) -> str:
+    """Remove control characters that confuse parsers and logs."""
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
 
 
 def fetch_unread_emails(gmail_service: Any | None = None) -> list[dict]:
@@ -187,7 +198,9 @@ def fetch_unread_emails(gmail_service: Any | None = None) -> list[dict]:
 
         body = _extract_body(full_message["payload"])
         soup = BeautifulSoup(body, "html.parser")
-        body = soup.get_text(separator="\n", strip=True)
+        body = _sanitize_email_text(
+            soup.get_text(separator="\n", strip=True)
+        )
 
         emails.append({
             "id": full_message["id"],
@@ -200,7 +213,7 @@ def fetch_unread_emails(gmail_service: Any | None = None) -> list[dict]:
     return emails
 
 
-@ai_function
+@tool
 def get_unread_emails() -> list[dict]:
     """Fetch unread emails from Gmail inbox."""
     logger.info("Fetching unread emails...")
@@ -222,7 +235,7 @@ def _format_reply(customer: str, lines: list[str]) -> str:
     return "\n".join([f"Hello {customer},", "", *lines, "", "Best regards,", "PaperCo Operations"])
 
 
-@ai_function()
+@tool()
 def respond_confirmation_email(message_id: str, pdf_url: str | None = None) -> dict[str, str]:
     """Send order confirmation email."""
     service, headers, thread_id = _load_reply_context(message_id)
@@ -240,7 +253,7 @@ def respond_confirmation_email(message_id: str, pdf_url: str | None = None) -> d
     return _send_reply(service, headers, thread_id, reply_body)
 
 
-@ai_function()
+@tool()
 def respond_unfulfillable_email(message_id: str, reason: str) -> dict[str, str]:
     """Send rejection email when order cannot be fulfilled."""
     service, headers, thread_id = _load_reply_context(message_id)
